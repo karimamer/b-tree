@@ -1,19 +1,17 @@
-{-# LANGUAGE TemplateHaskell, BangPatterns, GeneralizedNewtypeDeriving #-}
-
 module BTree.Merge ( mergeTrees
                    , mergeLeaves
                    , sizedProducerForTree
                    ) where
 
-import Prelude hiding (sum)
 import Control.Applicative
 import Data.Foldable
-import Data.Function (on)
 import Control.Monad.State hiding (forM_)
+import Control.Monad.Catch
 import Data.Binary
 import Control.Lens
 import Pipes
 import Pipes.Interleave
+import Prelude hiding (sum)
 
 import BTree.Types
 import BTree.Builder
@@ -24,7 +22,7 @@ import BTree.Walk
 -- Each producer must be annotated with the number of leaves it is
 -- expected to produce. The size of the resulting tree will be at most
 -- the sum of these sizes.
-mergeLeaves :: (MonadIO m, Functor m, Binary k, Binary e, Ord k)
+mergeLeaves :: (MonadMask m, MonadIO m, Functor m, Binary k, Binary e, Ord k)
             => (e -> e -> m e)               -- ^ merge operation on elements
             -> Order                         -- ^ order of merged tree
             -> FilePath                      -- ^ name of output file
@@ -33,17 +31,16 @@ mergeLeaves :: (MonadIO m, Functor m, Binary k, Binary e, Ord k)
 mergeLeaves append destOrder destFile producers = do
     let size = sum $ map fst producers
     fromOrderedToFile destOrder size destFile $
-      mergeM (compare `on` key) doAppend (map snd producers)
+      mergeM doAppend (map snd producers)
   where
     doAppend (BLeaf k e) (BLeaf _ e') = BLeaf k <$> append e e'
-    key (BLeaf k _) = k
 {-# INLINE mergeLeaves #-}
 
 -- | Merge several 'LookupTrees'
 --
 -- This is a convenience function for merging several trees already on
 -- disk. For a more flexible interface, see 'mergeLeaves'.
-mergeTrees :: (MonadIO m, Functor m, Binary k, Binary e, Ord k)
+mergeTrees :: (MonadMask m, MonadIO m, Functor m, Binary k, Binary e, Ord k)
            => (e -> e -> m e)        -- ^ merge operation on elements
            -> Order                  -- ^ order of merged tree
            -> FilePath               -- ^ name of output file

@@ -1,4 +1,5 @@
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module BTree.Builder
     ( buildNodes, putBS
@@ -8,12 +9,14 @@ module BTree.Builder
 
 import Control.Monad.Trans.State.Strict
 import Control.Monad.IO.Class
+import Control.Monad.Catch
 import Control.Monad
 
 import Data.Foldable as F
 import qualified Data.Sequence as Seq
 import           Data.Sequence (Seq)
 
+import Data.Word
 import Data.Ratio
 import Control.Lens
 import System.IO
@@ -21,6 +24,7 @@ import System.IO
 import qualified Data.Binary as B
 import           Data.Binary (Binary)
 import qualified Data.ByteString.Lazy as LBS
+import qualified Data.Vector as V
 
 import Pipes
 import Pipes.Core
@@ -32,7 +36,7 @@ import BTree.Types
 type DiskProducer a = Proxy X () (OnDisk a) a
 
 putBS :: (Binary a, Monad m) => a -> Proxy (OnDisk a) a () LBS.ByteString m r
-putBS a0 = {-# SCC putBS #-} evalStateT (go a0) 0
+putBS a0 = {-# SCC "putBS" #-} evalStateT (go a0) 0
   where
     go a = do
         s <- get
@@ -65,38 +69,38 @@ next' = go
 -- | Compute the optimal node sizes for each stratum of a tree of
 -- given size and order
 optimalFill :: Order -> Size -> [[Int]]
-optimalFill order size = go (fromIntegral size)
+optimalFill order size = go size
   where
-    go :: Int -> [[Int]]
+    go :: Word64 -> [[Int]]
     go 0 = error "BTree.Builder.optimalFill: zero size"
     go n =
       let nNodes = ceiling (n % order')
-          order' = fromIntegral order :: Int
+          order' = fromIntegral order :: Word64
           nodes = let (nPerNode, leftover) = n `divMod` nNodes
-                  in zipWith (+) (replicate nNodes nPerNode)
-                                 (replicate leftover 1 ++ repeat 0)
+                  in zipWith (+) (replicate (fromIntegral nNodes) (fromIntegral nPerNode))
+                                 (replicate (fromIntegral leftover) 1 ++ repeat 0)
           rest = case nNodes of
                    1  -> []
                    _  -> go nNodes
       in nodes : rest
 
+type BuildM k e m a = StateT [DepthState k e] (DiskProducer (BTree k OnDisk e) m) a
+
 -- | Given a producer of a known number of leaves, produces an optimal B-tree.
 -- Technically the size is only an upper bound: the producer may
 -- terminate before providing the given number of leaves although the resulting
 -- tree will break the minimal fill invariant.
-buildNodes :: Monad m
+buildNodes :: forall m k e r. Monad m
            => Order -> Size
            -> DiskProducer (BLeaf k e) m r
-           -> DiskProducer (BTree k OnDisk e) m (BTreeHeader k e)
-buildNodes order size = {-# SCC buildNodes #-}
+           -> DiskProducer (BTree k OnDisk e) m (Size, Maybe (OnDisk (BTree k OnDisk e)))
+buildNodes order size = {-# SCC "buildNodes" #-}
     flip evalStateT initialState . loop size
   where
     initialState = map (DepthS Seq.empty 0) $ optimalFill order size
     -- depth=0 denotes the bottom (leaves) of the tree.
-    loop :: Monad m
-         => Size -> DiskProducer (BLeaf k e) m r
-         -> StateT [DepthState k e] (DiskProducer (BTree k OnDisk e) m)
-                   (BTreeHeader k e)
+    loop :: Size -> DiskProducer (BLeaf k e) m r
+         -> BuildM k e m (Size, Maybe (OnDisk (BTree k OnDisk e)))
     loop n producer = do
         _next <- lift $ lift $ next' producer
         case _next of
@@ -109,16 +113,13 @@ buildNodes order size = {-# SCC buildNodes #-}
                 OnDisk offset <- processNode k $ Leaf leaf
                 loop (n-1) $ producer' (OnDisk offset)
 
-    isFilled :: Monad m
-             => StateT [DepthState k e] m Bool
+    isFilled :: BuildM k e m Bool
     isFilled = zoom (singular _head) $ do
         nodeCount <- use dNodeCount
         minFill:_ <- use dMinFill
         return $ nodeCount >= minFill
 
-    emitNode :: Monad m
-             => StateT [DepthState k e] (DiskProducer (BTree k OnDisk e) m)
-                       (OnDisk (BTree k OnDisk e))
+    emitNode :: BuildM k e m (OnDisk (BTree k OnDisk e))
     emitNode = do
         (k0,node0):nodes <- zoom (singular _head) $ do
             nodes <- uses dNodes F.toList
@@ -127,19 +128,18 @@ buildNodes order size = {-# SCC buildNodes #-}
             dMinFill %= tail
             return nodes
 
-        --when (null nodes)
-        --  $ error "BTree.Builder.buildNodes: Internal invariant broken: unexpected empty node"
-        let newNode = Node node0 nodes
+        -- We used to check the invariants of (not $ null nodes), however this
+        -- is wrong. nodes may be empty, for instance, when we are call from
+        -- the [_] branch of flushAll.
+
+        let newNode = Node node0 (V.fromList nodes)
         s <- get
         case s of
             [_] -> lift $ respond newNode
             _   -> zoom (singular _tail) $ processNode k0 newNode
 
-    processNode :: Monad m
-                => k -> BTree k OnDisk e
-                -> StateT [DepthState k e]
-                          (DiskProducer (BTree k OnDisk e) m)
-                          (OnDisk (BTree k OnDisk e))
+    processNode :: k -> BTree k OnDisk e
+                -> BuildM k e m (OnDisk (BTree k OnDisk e))
     processNode startKey tree = do
         filled <- isFilled
         when filled $ void $ emitNode
@@ -149,18 +149,16 @@ buildNodes order size = {-# SCC buildNodes #-}
             dNodeCount += 1
         return offset
 
-    flushAll :: Monad m
-             => Size
-             -> StateT [DepthState k e]
-                       (DiskProducer (BTree k OnDisk e) m)
-                       (BTreeHeader k e)
+    flushAll :: Size
+             -> BuildM k e m (Size, Maybe (OnDisk (BTree k OnDisk e)))
+    flushAll 0 = return (0, Nothing)
     flushAll realSize = do
         s <- get
         case s of
             []   -> error "BTree.Builder.flushAll: We should never get here"
             [_]  -> do -- We are at the top node, this shouldn't be flushed yet
                        root <- emitNode
-                       return $ BTreeHeader magic 1 order realSize root
+                       return (realSize, Just root)
             d:_  -> do when (not $ Seq.null $ d^.dNodes) $ void $ emitNode
                        zoom (singular _tail) $ flushAll realSize
 {-# INLINE buildNodes #-}
@@ -171,12 +169,20 @@ buildTree :: (Monad m, Binary e, Binary k)
           => Order -> Size
           -> Producer (BLeaf k e) m r
           -> Producer LBS.ByteString m (BTreeHeader k e)
-buildTree order size producer =
-    dropUpstream $ buildNodes order size (dropUpstream producer) >>~ putBS
+buildTree order size  producer
+  | size < 0  = error "BTree.buildTree: Invalid tree size"
+  | size == 0 = return zeroSizedHeader
+  | otherwise = do
+    (realSize, root) <- dropUpstream $ buildNodes order size (dropUpstream producer) >>~ putBS
+    if realSize == 0
+      then return zeroSizedHeader
+      else return $ BTreeHeader magic 1 order realSize root
+  where
+    zeroSizedHeader = BTreeHeader magic 1 order 0 Nothing
 {-# INLINE buildTree #-}
 
 dropUpstream :: Monad m => Proxy X () () b m r -> Proxy X () b' b m r
-dropUpstream = {-# SCC dropUpstream #-} go
+dropUpstream = {-# SCC "dropUpstream" #-} go
   where
     go producer = do
         n <- lift $ next producer
@@ -189,22 +195,20 @@ dropUpstream = {-# SCC dropUpstream #-} go
 --
 -- As the name suggests, this requires that the @Producer@ emits
 -- leaves in ascending key order.
-fromOrderedToFile :: (MonadIO m, Binary e, Binary k)
+fromOrderedToFile :: (MonadMask m, MonadIO m, Binary e, Binary k)
                   => Order                     -- ^ Order of tree
                   -> Size                      -- ^ Maximum tree size
                   -> FilePath                  -- ^ Output file
                   -> Producer (BLeaf k e) m r  -- ^ 'Producer' of elements
                   -> m ()
-fromOrderedToFile order size fname producer = do
-    h <- liftIO $ openFile fname WriteMode
-    liftIO $ LBS.hPut h $ B.encode invalidHeader
-    hdr <- runEffect $ for (buildTree order size producer) $ liftIO . LBS.hPut h
-    liftIO $ hSeek h AbsoluteSeek 0
-    liftIO $ LBS.hPut h $ B.encode hdr
-    liftIO $ hClose h
-    return ()
+fromOrderedToFile order size fname producer =
+    bracket (liftIO $ openFile fname WriteMode) (liftIO . hClose) $ \h -> do
+        liftIO $ LBS.hPut h $ B.encode invalidHeader
+        hdr <- runEffect $ for (buildTree order size producer) $ liftIO . LBS.hPut h
+        liftIO $ hSeek h AbsoluteSeek 0
+        liftIO $ LBS.hPut h $ B.encode hdr
   where
-    invalidHeader = BTreeHeader 0 0 0 0 (OnDisk 0)
+    invalidHeader = BTreeHeader 0 0 0 0 Nothing
 {-# INLINE fromOrderedToFile #-}
 
 -- | Build a B-tree into @ByteString@

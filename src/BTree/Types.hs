@@ -4,15 +4,23 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE RecordWildCards #-}
 
 module BTree.Types where
 
-import Data.Binary
+import Control.Applicative
+import Data.Maybe (fromMaybe)
 import GHC.Generics
 import Control.Monad (when)
-import Control.Applicative
-import Control.Lens
 import Data.Int
+import Prelude
+
+import Data.Binary
+import Data.Binary.Get
+import Data.Binary.Put
+import Control.Lens
+import qualified Data.Vector as V
+import Data.Vector.Binary
 import qualified Data.ByteString as BS
 
 -- | An offset within the stream
@@ -24,7 +32,7 @@ type Size = Word64
 -- | The maximum number of children of a B-tree inner node
 type Order = Word64
 
--- | 'OnDisk a' is a reference to an object of type 'a' on disk.
+-- | @'OnDisk' a@ is a reference to an object of type @a@ on disk.
 -- The offset does not include the header; e.g. the first object after
 -- the header is located at offset 0.
 newtype OnDisk a = OnDisk Offset
@@ -57,12 +65,12 @@ instance (Binary k, Binary e) => Binary (BLeaf k e) where
     put (BLeaf k e) = put k >> put e
     {-# INLINE put #-}
 
--- | 'BTree k f e' is a B* tree of key type 'k' with elements of type 'e'.
--- Subtree references are contained within a type 'f'
+-- | @'BTree' k f e@ is a B* tree of key type @k@ with elements of type @e@.
+-- Subtree references are contained within a type @f@.
 --
--- The Node constructor contains a left child, and a list of key/child pairs
+-- The 'Node' constructor contains a left child, and a list of key/child pairs
 -- where each child's keys are greater than or equal to the given key.
-data BTree k f e = Node (f (BTree k f e)) [(k, f (BTree k f e))]
+data BTree k f e = Node (f (BTree k f e)) (V.Vector (k, f (BTree k f e)))
                  | Leaf !(BLeaf k e)
                  deriving (Generic)
 
@@ -73,14 +81,21 @@ instance (Binary k, Binary (f (BTree k f e)), Binary e)
   => Binary (BTree k f e) where
     get = do typ <- getWord8
              case typ of
-               0 -> Node <$> get <*> get
+               0 -> Node <$> get <*> getChildren
                1 -> bleaf <$> get <*> get
                _ -> fail "BTree.Types/get: Unknown node type"
       where bleaf k v = Leaf (BLeaf k v)
+            getChildren =
+                genericGetVectorWith (fromIntegral <$> getWord32be) ((,) <$> get <*> get)
     {-# INLINE get #-}
 
-    put (Node e0 es)         = putWord8 0 >> put e0 >> put es
-    put (Leaf (BLeaf k0 e))  = putWord8 1 >> put k0 >> put e
+    -- some versions of binary don't inline the Binary (,) instance, pitiful
+    -- performance ensues
+    put (Node e0 es) = do
+        putWord8 0
+        put e0
+        genericPutVectorWith (putWord32be . fromIntegral) (\(a,b) -> put a >> put b) es
+    put (Leaf (BLeaf k0 e)) = putWord8 1 >> put k0 >> put e
     {-# INLINE put #-}
 
 magic :: Word64
@@ -91,12 +106,28 @@ data BTreeHeader k e = BTreeHeader { _btMagic   :: !Word64
                                    , _btVersion :: !Word64
                                    , _btOrder   :: !Order
                                    , _btSize    :: !Size
-                                   , _btRoot    :: !(OnDisk (BTree k OnDisk e))
+                                   , _btRoot    :: !(Maybe (OnDisk (BTree k OnDisk e)))
+                                     -- ^ 'Nothing' represents an empty tree
                                    }
                  deriving (Show, Eq, Generic)
 makeLenses ''BTreeHeader
 
-instance Binary (BTreeHeader k e)
+-- | It is critical that this encoding is of fixed size
+instance Binary (BTreeHeader k e) where
+    get = do
+        _btMagic <- get
+        _btVersion <- get
+        _btOrder <- get
+        _btSize <- get
+        root <- get
+        let _btRoot = if root == OnDisk 0 then Nothing else Just root
+        return BTreeHeader {..}
+    put (BTreeHeader {..}) = do
+        put _btMagic
+        put _btVersion
+        put _btOrder
+        put _btSize
+        put $ fromMaybe (OnDisk 0) _btRoot
 
 validateHeader :: BTreeHeader k e -> Either String ()
 validateHeader hdr = do

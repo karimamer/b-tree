@@ -1,3 +1,5 @@
+-- | This package provides immutable B* trees targetting large data
+-- sets requiring secondary storage.
 module BTree ( -- * Basic types
                BLeaf(..)
              , Size
@@ -11,6 +13,7 @@ module BTree ( -- * Basic types
              , open
              , fromByteString
              , lookup
+             , size
                -- * Merging trees
              , mergeTrees
              , mergeLeaves
@@ -26,6 +29,3 @@ import BTree.Builder
 import BTree.Lookup
 import BTree.Walk
 import BTree.BuildUnordered
-
--- | This package provides immutable B* trees targetting large data
--- sets requiring secondary storage.
